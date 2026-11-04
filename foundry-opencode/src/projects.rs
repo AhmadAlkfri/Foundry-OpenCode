@@ -860,6 +860,7 @@ mod tests {
             assert!(
                 Command::new("git")
                     .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                    .args(["-c", "commit.gpgsign=false"])
                     .args(args)
                     .current_dir(&main)
                     .status()

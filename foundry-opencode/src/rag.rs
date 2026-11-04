@@ -60,6 +60,25 @@ pub fn ready(project: &Path, base_url: &str) -> bool {
             .is_file()
 }
 
+/// Rewrites an earlier installer `rag.json` (with a backup) so an otherwise working setup stays
+/// enabled instead of going through a full re-setup. Returns whether it changed anything.
+pub fn upgrade_config(project: &Path, base_url: &str) -> eyre::Result<bool> {
+    let path = project.join(".opencode/rag.json");
+    if !fs::symlink_metadata(&path)
+        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+        || fs::read_to_string(&path)? != rag_config(base_url, &LEGACY_EXCLUDE_DIRS)
+    {
+        return Ok(false);
+    }
+    let backup = crate::ops::backup_path(&path);
+    fs::rename(&path, &backup)?;
+    if let Err(error) = fs::write(&path, rag_config(base_url, &EXCLUDE_DIRS)) {
+        fs::rename(&backup, &path)?;
+        return Err(error.into());
+    }
+    Ok(true)
+}
+
 pub fn legacy_plugin(project: &Path) -> eyre::Result<Option<PathBuf>> {
     let open = project.join(".opencode");
     let dir = open.join("plugins");
@@ -438,6 +457,32 @@ mod tests {
         );
         fs::write(&config, "{}").unwrap();
         assert!(setup_files(&root, "https://example.com", false).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn earlier_rag_config_upgrade_keeps_a_working_setup_ready() {
+        let root = crate::ops::backup_path(&std::env::temp_dir().join("rag-config-in-place"));
+        fs::create_dir(&root).unwrap();
+        let url = "https://example.com";
+        setup_files(&root, url, false).unwrap();
+        fs::create_dir_all(root.join(".opencode/node_modules/opencode-rag-plugin/dist/cli"))
+            .unwrap();
+        fs::write(
+            root.join(".opencode/node_modules/opencode-rag-plugin/dist/cli/index.js"),
+            "",
+        )
+        .unwrap();
+        fs::create_dir(root.join(".opencode/rag_db")).unwrap();
+        let config = root.join(".opencode/rag.json");
+        fs::write(&config, rag_config(url, &LEGACY_EXCLUDE_DIRS)).unwrap();
+        assert!(!ready(&root, url));
+        assert!(upgrade_config(&root, url).unwrap());
+        assert!(ready(&root, url));
+        assert!(!upgrade_config(&root, url).unwrap());
+        fs::write(&config, "{\"edited\":true}\n").unwrap();
+        assert!(!upgrade_config(&root, url).unwrap());
+        assert_eq!(fs::read_to_string(&config).unwrap(), "{\"edited\":true}\n");
         fs::remove_dir_all(root).unwrap();
     }
 

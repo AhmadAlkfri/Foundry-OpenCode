@@ -11,6 +11,11 @@ use color_eyre::eyre::{self, Context};
 /// The global Git alias this installer can manage.
 pub const ALIAS: &str = "!foundry-opencode sync-worktrees";
 const MARK: &str = "# foundry-opencode: worktrees share the main checkout's .opencode (local only)";
+const GITIGNORE_MARK: &str =
+    "# foundry-opencode: local OpenCode and OpenChamber setup, never committed";
+/// Folders that hold one machine's OpenCode/OpenChamber setup and must never reach a remote.
+const LOCAL: [&str; 2] = [".opencode", ".openchamber"];
+const HELPER: &str = ".opencode/rag-cli.mjs";
 
 pub struct Worktree {
     pub path: PathBuf,
@@ -52,7 +57,8 @@ fn git(dir: &Path, args: &[&str]) -> eyre::Result<String> {
 }
 
 fn absolute(dir: &Path, which: &str) -> eyre::Result<PathBuf> {
-    Ok(PathBuf::from(git(dir, &["rev-parse", "--path-format=absolute", which])?).canonicalize()?)
+    // Git prints these relative to `dir`; `--path-format=absolute` would need Git 2.31.
+    Ok(dir.join(git(dir, &["rev-parse", which])?).canonicalize()?)
 }
 
 /// Every checkout of the repository containing `dir`; Git lists the main checkout first.
@@ -84,8 +90,27 @@ pub fn main_of(dir: &Path) -> eyre::Result<Option<PathBuf>> {
     Ok(list(dir)?.into_iter().next().map(|main| main.path))
 }
 
+/// Whether `link`, inside a worktree's `.opencode`, was made by this installer for `source`,
+/// including one left dangling because the main checkout has since moved.
+fn ours(link: &Path, source: &Path) -> bool {
+    let Ok(target) = fs::read_link(link) else {
+        return false;
+    };
+    target.starts_with(source)
+        || !target.exists()
+            && target.file_name() == link.file_name()
+            && target.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".opencode"))
+}
+
+/// Whether `link` may create links in this worktree: its `.opencode` is missing or a real folder.
+fn linkable(worktree: &Path) -> bool {
+    fs::symlink_metadata(worktree.join(".opencode"))
+        .map_or(true, |meta| meta.is_dir() && !meta.file_type().is_symlink())
+}
+
 /// Links each shared entry of `main/.opencode` into `worktree/.opencode`. Nothing existing is
-/// replaced, and a worktree whose `.opencode` is itself a link or a file is left alone.
+/// replaced, except this installer's links left dangling by a moved main checkout. A worktree
+/// whose `.opencode` is itself a link or a file is left alone.
 pub fn link(main: &Path, worktree: &Path) -> eyre::Result<usize> {
     let source = main.join(".opencode");
     if !fs::symlink_metadata(&source)
@@ -107,8 +132,14 @@ pub fn link(main: &Path, worktree: &Path) -> eyre::Result<usize> {
     let mut linked = 0;
     for name in names {
         let path = target.join(&name);
-        if per_worktree(&name.to_string_lossy()) || fs::symlink_metadata(&path).is_ok() {
+        if per_worktree(&name.to_string_lossy()) {
             continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(_) if ours(&path, &source) && !path.exists() => fs::remove_file(&path)?,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         std::os::unix::fs::symlink(source.join(&name), &path)
             .wrap_err_with(|| format!("Could not link {}", path.display()))?;
@@ -129,7 +160,7 @@ pub fn unlink(main: &Path, worktree: &Path) -> eyre::Result<()> {
         let path = entry?.path();
         let meta = fs::symlink_metadata(&path)?;
         if meta.file_type().is_symlink() {
-            if fs::read_link(&path)?.starts_with(&source) {
+            if ours(&path, &source) {
                 fs::remove_file(&path)?;
             }
         } else if generated(&path.file_name().unwrap().to_string_lossy()) {
@@ -155,65 +186,119 @@ pub fn linked(main: &Path) -> Vec<PathBuf> {
         .skip(1)
         .map(|worktree| worktree.path)
         .filter(|path| {
-            fs::read_dir(path.join(".opencode")).is_ok_and(|entries| {
-                entries.flatten().any(|entry| {
-                    fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(&source))
-                })
-            })
+            fs::read_dir(path.join(".opencode"))
+                .is_ok_and(|entries| entries.flatten().any(|entry| ours(&entry.path(), &source)))
         })
         .collect()
 }
 
 fn exclude_file(repo: &Path) -> eyre::Result<PathBuf> {
-    let path = absolute(repo, "--git-common-dir")?.join("info/exclude");
-    if let Ok(meta) = fs::symlink_metadata(&path) {
-        eyre::ensure!(
-            meta.is_file() && !meta.file_type().is_symlink(),
-            "Unsafe {}",
-            path.display()
-        );
-    }
-    Ok(path)
+    Ok(absolute(repo, "--git-common-dir")?.join("info/exclude"))
 }
 
-/// Hides `.opencode` in every worktree and branch through the repository's local, never-pushed
-/// exclude file. Repositories that track files under `.opencode` keep their own rules.
-pub fn exclude(repo: &Path) -> eyre::Result<bool> {
-    if !git(repo, &["ls-files", "--", ".opencode"])?.is_empty() {
-        return Ok(false);
+/// The text of a regular file, or "" when it does not exist yet. Refuses links and folders.
+fn read_plain(path: &Path) -> eyre::Result<String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            eyre::ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "Unsafe {}",
+                path.display()
+            );
+            Ok(fs::read_to_string(path)?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
     }
-    let path = exclude_file(repo)?;
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    if text.lines().any(|line| line == MARK) {
-        return Ok(false);
-    }
-    fs::create_dir_all(path.parent().unwrap())?;
+}
+
+fn append(path: &Path, text: &str, mark: &str, names: &[&str]) -> eyre::Result<()> {
     let separator = if text.is_empty() || text.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    fs::write(&path, format!("{text}{separator}{MARK}\n.opencode\n"))?;
-    Ok(true)
+    fs::write(
+        path,
+        format!("{text}{separator}{mark}\n{}\n", names.join("\n")),
+    )?;
+    Ok(())
 }
 
-/// Removes only the entry `exclude` added.
+/// Adds the local folders to the repository's never-pushed `.git/info/exclude`, which applies to
+/// every worktree and branch at once.
+fn exclude(repo: &Path) -> eyre::Result<()> {
+    let path = exclude_file(repo)?;
+    let text = read_plain(&path)?;
+    if !text.lines().any(|line| line == MARK) {
+        fs::create_dir_all(path.parent().unwrap())?;
+        append(&path, &text, MARK, &LOCAL)?;
+    }
+    Ok(())
+}
+
+/// Whether `.gitignore` already ignores `name` at the root (`.opencode`, `/.opencode/`, ...).
+fn listed(text: &str, name: &str) -> bool {
+    text.lines()
+        .map(|line| line.trim().trim_start_matches('/').trim_end_matches('/'))
+        .any(|line| line == name)
+}
+
+/// Keeps `.opencode` and `.openchamber` out of Git: in the repository's `.gitignore`, so every
+/// clone ignores them, and in `.git/info/exclude`, which covers every worktree and branch before
+/// that change is committed. Files already committed there are reported, never removed.
+pub fn ignore(repo: &Path) -> eyre::Result<Vec<String>> {
+    let mut messages = Vec::new();
+    let gitignore = repo.join(".gitignore");
+    let text = read_plain(&gitignore)?;
+    let missing: Vec<&str> = LOCAL
+        .into_iter()
+        .filter(|name| !listed(&text, name))
+        .collect();
+    if !missing.is_empty() {
+        append(&gitignore, &text, GITIGNORE_MARK, &missing)?;
+        messages.push(format!(
+            "Added {} to {}; commit this change",
+            missing.join(" and "),
+            gitignore.display()
+        ));
+    }
+    exclude(repo)?;
+    let tracked = git(repo, &["ls-files", "--", ".opencode", ".openchamber"])?;
+    if !tracked.is_empty() {
+        let files: Vec<&str> = tracked.lines().collect();
+        messages.push(format!(
+            "{} commits machine-specific files under .opencode/.openchamber ({}{}). Remove them from the repository with: git rm -r --cached .opencode .openchamber, then commit",
+            repo.display(),
+            files[..files.len().min(3)].join(", "),
+            if files.len() > 3 {
+                format!(" and {} more", files.len() - 3)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    Ok(messages)
+}
+
+/// Whether this installer's entry is in the repository's `.git/info/exclude`.
+pub fn excluded(repo: &Path) -> bool {
+    exclude_file(repo)
+        .and_then(|path| read_plain(&path))
+        .is_ok_and(|text| text.lines().any(|line| line == MARK))
+}
+
+/// Removes only the `.git/info/exclude` entry this installer added. `.gitignore` lines are kept.
 pub fn unexclude(repo: &Path) -> eyre::Result<()> {
     let path = exclude_file(repo)?;
-    let Ok(text) = fs::read_to_string(&path) else {
-        return Ok(());
-    };
+    let text = read_plain(&path)?;
     let mut kept = String::new();
     let mut changed = false;
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         if line == MARK {
             changed = true;
-            lines.next_if_eq(&".opencode");
+            while lines.next_if(|line| LOCAL.contains(line)).is_some() {}
         } else {
             kept.push_str(line);
             kept.push('\n');
@@ -225,15 +310,10 @@ pub fn unexclude(repo: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Prepares a configured main checkout for worktrees: hides `.opencode` and links every worktree.
+/// Prepares a configured main checkout for worktrees: keeps the local folders out of Git and links
+/// every worktree.
 pub fn share(repo: &Path) -> eyre::Result<Vec<String>> {
-    let mut messages = Vec::new();
-    if exclude(repo)? {
-        messages.push(format!(
-            "Hid .opencode in all worktrees of {} (.git/info/exclude)",
-            repo.display()
-        ));
-    }
+    let mut messages = ignore(repo)?;
     for worktree in list(repo)?
         .into_iter()
         .skip(1)
@@ -250,6 +330,71 @@ pub fn share(repo: &Path) -> eyre::Result<Vec<String>> {
     Ok(messages)
 }
 
+/// The remote to sync from: the one the main checkout's branch tracks, else the only remote, else
+/// `origin`.
+fn remote(main: &Path, branch: Option<&str>) -> eyre::Result<String> {
+    if let Some(branch) = branch
+        && let Ok(remote) = git(main, &["config", &format!("branch.{branch}.remote")])
+        && remote != "."
+    {
+        return Ok(remote);
+    }
+    let names = git(main, &["remote"])?;
+    let names: Vec<&str> = names.lines().collect();
+    match names.as_slice() {
+        [only] => Ok((*only).to_owned()),
+        _ if names.contains(&"origin") => Ok("origin".into()),
+        [] => eyre::bail!("This repository has no remote to sync from"),
+        _ => eyre::bail!(
+            "Several remotes ({}) and the main checkout's branch tracks none; set one with git branch --set-upstream-to",
+            names.join(", ")
+        ),
+    }
+}
+
+/// The remote's default branch: its remote HEAD, else what the remote reports, else main or master.
+fn default_branch(main: &Path, remote: &str, online: bool) -> eyre::Result<String> {
+    if let Ok(head) = git(
+        main,
+        &[
+            "symbolic-ref",
+            "-q",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ],
+    ) && let Some(branch) = head.strip_prefix(&format!("{remote}/"))
+    {
+        return Ok(branch.to_owned());
+    }
+    if online
+        && let Ok(text) = git(main, &["ls-remote", "--symref", remote, "HEAD"])
+        && let Some(branch) = text.lines().find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")?
+                .strip_suffix("\tHEAD")
+        })
+    {
+        return Ok(branch.to_owned());
+    }
+    for branch in ["main", "master"] {
+        if git(
+            main,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/remotes/{remote}/{branch}"),
+            ],
+        )
+        .is_ok()
+        {
+            return Ok(branch.into());
+        }
+    }
+    eyre::bail!(
+        "Could not find the default branch of {remote}; run git remote set-head {remote} --auto"
+    )
+}
+
 fn paint(code: &str, text: &str) -> String {
     if std::io::stdout().is_terminal() {
         format!("\x1b[{code}m{text}\x1b[0m")
@@ -262,24 +407,23 @@ fn paint(code: &str, text: &str) -> String {
 /// latest default branch, links the shared configuration and refreshes each RAG index.
 /// Worktrees on another branch or with uncommitted work are reported and not moved.
 pub fn sync(dir: &Path, dry_run: bool) -> eyre::Result<bool> {
-    if !dry_run {
-        git(dir, &["fetch", "-q", "origin"]).wrap_err("git fetch origin failed")?;
-    }
-    let upstream = git(
-        dir,
-        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
-    )
-    .unwrap_or_else(|_| "origin/master".into());
-    let default = upstream
-        .strip_prefix("origin/")
-        .unwrap_or(&upstream)
-        .to_owned();
-    let target = git(dir, &["rev-parse", "--short", &upstream])?;
     let worktrees = list(dir)?;
-    let main = worktrees
+    let first = worktrees
         .first()
-        .map(|item| item.path.clone())
         .ok_or_else(|| eyre::eyre!("No worktrees found"))?;
+    let main = first.path.clone();
+    let remote = remote(&main, first.branch.as_deref())?;
+    if !dry_run {
+        git(&main, &["fetch", "-q", &remote])
+            .wrap_err_with(|| format!("git fetch {remote} failed"))?;
+    }
+    let default = default_branch(&main, &remote, !dry_run)?;
+    let upstream = format!("{remote}/{default}");
+    let target = git(&main, &["rev-parse", "--short", &upstream])?;
+    println!(
+        "{}",
+        paint("2", &format!("Syncing worktrees to {upstream} ({target})"))
+    );
     let would = if dry_run { "would move" } else { "->" };
     let mut ok = true;
     for worktree in worktrees.iter().filter(|item| !item.bare) {
@@ -300,7 +444,14 @@ pub fn sync(dir: &Path, dry_run: bool) -> eyre::Result<bool> {
             Some(branch) if branch != &default => Err(format!("is on branch {branch}. Not moved.")),
             branch => match git(
                 path,
-                &["status", "--porcelain", "--", ".", ":(exclude).opencode"],
+                &[
+                    "status",
+                    "--porcelain",
+                    "--",
+                    ".",
+                    ":(exclude).opencode",
+                    ":(exclude).openchamber",
+                ],
             ) {
                 Err(error) => Err(format!("could not be checked: {error}")),
                 Ok(changes) if !changes.is_empty() => {
@@ -343,8 +494,9 @@ pub fn sync(dir: &Path, dry_run: bool) -> eyre::Result<bool> {
                 }
             }
         }
-        let has_rag = path.join(".opencode/rag-cli.mjs").is_file()
-            || path != &main && main.join(".opencode/rag-cli.mjs").is_file();
+        // Index only where the helper really is; a dry run predicts the link it would make.
+        let has_rag = path.join(HELPER).is_file()
+            || dry_run && path != &main && linkable(path) && main.join(HELPER).is_file();
         if !has_rag {
             println!(
                 "        {}",
@@ -362,7 +514,7 @@ pub fn sync(dir: &Path, dry_run: bool) -> eyre::Result<bool> {
             let indexed = File::create(&log).and_then(|out| {
                 let err = out.try_clone()?;
                 Command::new("node")
-                    .args([".opencode/rag-cli.mjs", "index"])
+                    .args([HELPER, "index"])
                     .current_dir(path)
                     .stdin(Stdio::null())
                     .stdout(out)
@@ -471,6 +623,10 @@ mod tests {
                 "user.email=t@example.com",
                 "-c",
                 "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
             ])
             .args(args)
             .current_dir(dir)
@@ -574,6 +730,22 @@ mod tests {
         assert_eq!(link(&main, &custom).unwrap(), 0);
         assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
 
+        let link_path = worktree.join(".opencode/opencode.json");
+        fs::remove_file(&link_path).unwrap();
+        std::os::unix::fs::symlink(root.join("moved-away/.opencode/opencode.json"), &link_path)
+            .unwrap();
+        assert_eq!(link(&main, &worktree).unwrap(), 1);
+        assert_eq!(
+            fs::read_link(&link_path).unwrap(),
+            main.join(".opencode/opencode.json")
+        );
+        std::os::unix::fs::symlink(
+            root.join("moved-away/.opencode/stale.json"),
+            worktree.join(".opencode/stale.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), worktree.join(".opencode/notes")).unwrap();
+
         fs::create_dir(worktree.join(".opencode/rag_db")).unwrap();
         fs::write(worktree.join(".opencode/sync-index.log"), "log").unwrap();
         fs::write(worktree.join(".opencode/opencode.json.backup-2"), "keep").unwrap();
@@ -583,33 +755,53 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, ["opencode.json.backup-2", "rag.json"]);
+        assert_eq!(left, ["notes", "opencode.json.backup-2", "rag.json"]);
         assert!(main.join(".opencode/opencode.json").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn exclude_hides_opencode_for_every_worktree_and_is_removed_cleanly() {
+    fn ignore_keeps_local_folders_out_of_git_in_every_clone_and_worktree() {
         let root = sandbox();
         let main = repository(&root);
-        let file = main.join(".git/info/exclude");
-        fs::write(&file, "keep").unwrap();
+        let exclude_path = main.join(".git/info/exclude");
+        fs::write(&exclude_path, "keep").unwrap();
+        fs::write(main.join(".gitignore"), "/.opencode/\nnode_modules").unwrap();
+        run(&main, &["add", ".gitignore"]);
+        run(&main, &["commit", "-qm", "ignore"]);
         run(&main, &["worktree", "add", "-q", "--detach", "../linked"]);
-        assert!(exclude(&main).unwrap());
-        assert!(!exclude(&root.join("linked")).unwrap());
-        assert_eq!(run(&main, &["status", "--porcelain"]), "");
+        let messages = ignore(&main).unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].starts_with("Added .openchamber to"));
+        assert_eq!(
+            fs::read_to_string(main.join(".gitignore")).unwrap(),
+            format!("/.opencode/\nnode_modules\n{GITIGNORE_MARK}\n.openchamber\n")
+        );
+        assert!(ignore(&main).unwrap().is_empty());
+        assert!(excluded(&main));
+        fs::create_dir(main.join(".openchamber")).unwrap();
+        fs::write(main.join(".openchamber/state"), "local").unwrap();
         link(&main, &root.join("linked")).unwrap();
+        assert_eq!(run(&main, &["status", "--porcelain"]), " M .gitignore");
         assert_eq!(run(&root.join("linked"), &["status", "--porcelain"]), "");
         assert_eq!(linked(&main), [root.join("linked")]);
         unexclude(&main).unwrap();
-        assert_eq!(fs::read_to_string(&file).unwrap(), "keep\n");
+        assert_eq!(fs::read_to_string(&exclude_path).unwrap(), "keep\n");
+        assert!(!excluded(&main));
 
         let tracked = root.join("tracked");
         fs::create_dir_all(tracked.join(".opencode")).unwrap();
         run(&tracked, &["init", "-q"]);
         fs::write(tracked.join(".opencode/agent.md"), "shared").unwrap();
         run(&tracked, &["add", ".opencode/agent.md"]);
-        assert!(!exclude(&tracked).unwrap());
+        let messages = ignore(&tracked).unwrap();
+        assert!(messages[0].starts_with("Added .opencode and .openchamber to"));
+        assert!(
+            messages[1].contains(".opencode/agent.md")
+                && messages[1].contains("git rm -r --cached"),
+            "{messages:?}"
+        );
+        assert_eq!(run(&tracked, &["ls-files"]), ".opencode/agent.md");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -628,6 +820,9 @@ mod tests {
         run(&main, &["worktree", "add", "-q", "--detach", "../dirty"]);
         fs::write(root.join("dirty/file"), "edited\n").unwrap();
         run(&main, &["worktree", "add", "-q", "--detach", "../broken"]);
+        run(&main, &["worktree", "add", "-q", "--detach", "../custom"]);
+        fs::create_dir(root.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("custom/.opencode")).unwrap();
         run(&root, &["clone", "-q", "origin.git", "other"]);
         fs::write(root.join("other/file"), "two\n").unwrap();
         run(&root.join("other"), &["commit", "-qam", "two"]);
@@ -663,6 +858,37 @@ mod tests {
         run(&main, &["worktree", "remove", "--force", "../dirty"]);
         run(&main, &["worktree", "remove", "--force", "../feature"]);
         assert!(sync(&main, false).unwrap());
+        assert!(
+            fs::read_dir(root.join("elsewhere"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_uses_the_tracked_remote_whatever_its_name() {
+        let root = sandbox();
+        let main = repository(&root);
+        exclude(&main).unwrap();
+        run(&main, &["remote", "rename", "origin", "upstream"]);
+        run(&main, &["remote", "set-head", "upstream", "-d"]);
+        run(&main, &["remote", "add", "mirror", "../origin.git"]);
+        run(&main, &["worktree", "add", "-q", "--detach", "../linked"]);
+        run(&root, &["clone", "-q", "origin.git", "other"]);
+        fs::write(root.join("other/file"), "two\n").unwrap();
+        run(&root.join("other"), &["commit", "-qam", "two"]);
+        run(&root.join("other"), &["push", "-q"]);
+        assert_eq!(remote(&main, Some("main")).unwrap(), "upstream");
+        assert!(sync(&root.join("linked"), false).unwrap());
+        let latest = run(&main, &["rev-parse", "upstream/main"]);
+        assert_eq!(run(&root.join("linked"), &["rev-parse", "HEAD"]), latest);
+        assert_eq!(run(&main, &["rev-parse", "HEAD"]), latest);
+        assert_eq!(default_branch(&main, "upstream", false).unwrap(), "main");
+        run(&main, &["branch", "--unset-upstream"]);
+        let error = remote(&main, Some("main")).unwrap_err().to_string();
+        assert!(error.contains("Several remotes"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

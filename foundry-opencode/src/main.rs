@@ -83,6 +83,10 @@ fn main() -> eyre::Result<()> {
             return Ok(());
         }
         Some(Mode::SyncWorktrees) => {
+            // Exit quietly when piped into `head` instead of panicking on a closed stdout.
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            }
             if !worktrees::sync(&std::env::current_dir()?, args.dry_run)? {
                 std::process::exit(1);
             }
@@ -335,6 +339,17 @@ fn init(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> {
         total: 1 + usize::from(project.rag) * 2,
         output: Vec::new(),
     };
+    let upgraded = if project.rag {
+        upgrade_rag(
+            terminal,
+            &mut progress,
+            &cwd,
+            &stack.url,
+            &catalog.tokens[&stack.id],
+        )?
+    } else {
+        None
+    };
     let existing_rag = project.rag && rag::ready(&cwd, &stack.url);
     let backups = projects::write_project(&user_home, project, stack)?;
     let mut result = format!(
@@ -342,6 +357,9 @@ fn init(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> {
         cwd.display(),
         backups.len()
     );
+    if let Some(message) = upgraded {
+        result.push_str(&format!("\n{message}"));
+    }
     if existing_rag {
         result.push_str("\nReused the existing RAG index.");
     } else if project.rag {
@@ -1008,9 +1026,17 @@ fn uninstall(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> 
                 .join("\n")
         ));
     }
-    review.push_str(
-        "\nRemove the .opencode entry this installer added to each repository's .git/info/exclude.",
-    );
+    let excluded: Vec<String> = repositories
+        .iter()
+        .filter(|repo| worktrees::excluded(repo))
+        .map(|repo| repo.display().to_string())
+        .collect();
+    if !excluded.is_empty() {
+        review.push_str(&format!(
+            "\nRemove this installer's .opencode/.openchamber entry from .git/info/exclude (.gitignore lines are kept) in:\n{}",
+            excluded.join("\n")
+        ));
+    }
     if let Some(change) = worktrees::alias_plan(false, None)? {
         review.push_str(&format!("\n{change}"));
     }
@@ -1541,7 +1567,42 @@ fn collect_install_plan(
     }))
 }
 
-/// Hides `.opencode` for all worktrees of a configured repository and links their shared config.
+/// Upgrades an earlier installer `rag.json` in place, so RAG stays enabled, then reindexes so the
+/// new exclusions apply. A failed reindex keeps the previous index and RAG enabled.
+fn upgrade_rag(
+    terminal: &mut DefaultTerminal,
+    progress: &mut Progress,
+    project: &std::path::Path,
+    url: &str,
+    token: &str,
+) -> eyre::Result<Option<String>> {
+    if !rag::upgrade_config(project, url)? {
+        return Ok(None);
+    }
+    let mut node = Process::new("node");
+    node.args([".opencode/rag-cli.mjs", "index"])
+        .current_dir(project)
+        .env("OPENAI_API_KEY", token);
+    Ok(Some(
+        match run(
+            terminal,
+            progress,
+            "Reindexing with updated RAG settings",
+            node,
+        ) {
+            Ok(()) => format!(
+                "Updated RAG settings for {} (skips build caches and generated SDKs) and reindexed",
+                project.display()
+            ),
+            Err(error) => format!(
+                "Updated RAG settings for {}; reindex failed ({error}). RAG stays enabled with the previous index; retry with node .opencode/rag-cli.mjs index",
+                project.display()
+            ),
+        },
+    ))
+}
+
+/// Keeps local setup folders out of Git for a configured repository and links its worktrees.
 fn share_worktrees(repo: &std::path::Path) -> Vec<String> {
     worktrees::share(repo).unwrap_or_else(|error| {
         vec![format!(
@@ -1568,6 +1629,17 @@ fn configure_projects(
             terminal,
             &format!("Configuring repository {}", project.path.display()),
         )?;
+        let upgraded = if project.rag {
+            upgrade_rag(
+                terminal,
+                progress,
+                &project.path,
+                &chosen.url,
+                &catalog.tokens[&chosen.id],
+            )?
+        } else {
+            None
+        };
         let existing_rag = project.rag && rag::ready(&project.path, &chosen.url);
         let backups = projects::write_project(&user_home, project, chosen)?;
         result.push(format!(
@@ -1576,6 +1648,7 @@ fn configure_projects(
             chosen.name,
             backups.len()
         ));
+        result.extend(upgraded);
         if existing_rag {
             register_rag_project(&user_home, &project.path)?;
             result.push(format!(

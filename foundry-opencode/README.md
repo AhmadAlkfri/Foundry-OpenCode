@@ -41,7 +41,7 @@ Select **Initialize RAG** for a repository, or run `foundry-opencode init-rag` f
 
 ## Worktrees
 
-Only a repository's main checkout can be selected; worktrees are refused with a pointer to it. Install/update link each worktree's `.opencode` entries to the main checkout's (the RAG index, logs and backups stay per worktree) and add `.opencode` to the local `.git/info/exclude`, unless the repository tracks files under `.opencode`. `sync-worktrees` moves every clean worktree to the latest default branch, flags branches, uncommitted work and unpushed commits without moving them, links missing entries and reindexes each checkout incrementally. The optional `git sync-worktrees` alias runs it; uninstall removes links, indexes, the exclude entry and the installer's alias.
+Only a repository's main checkout can be selected; worktrees are refused with a pointer to it. Install/update link each worktree's `.opencode` entries to the main checkout's (the RAG index, logs and backups stay per worktree) and repair links a moved main checkout left dangling. `.opencode` and `.openchamber` are added to each repository's `.gitignore` and to its local `.git/info/exclude`; files already committed there are reported, not removed. `sync-worktrees` uses the remote the main checkout's branch tracks (or the only remote, or `origin`) and moves every clean worktree to its latest default branch, flags branches, uncommitted work and unpushed commits without moving them, links missing entries and reindexes each checkout incrementally. The optional `git sync-worktrees` alias runs it; uninstall removes links, indexes, the exclude entry and the installer's alias.
 
 ## Safety
 
