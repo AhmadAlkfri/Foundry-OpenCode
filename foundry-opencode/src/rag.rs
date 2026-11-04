@@ -12,6 +12,43 @@ const PATCH: &str = include_str!("rag-patch.mjs");
 const CLI: &str = include_str!("rag-cli.mjs");
 const LEGACY_CLI: &str = include_str!("rag-cli-legacy.mjs");
 const IGNORE: &str = "node_modules/\nrag_db/\nrag_db.backup-*/\nrag_db_tmp/\nopencode-rag.log\nruntime-overrides.json\n";
+// Build caches, local ontology state and generated SDKs churn on every build and crowd out source code.
+const EXCLUDE_DIRS: [&str; 11] = [
+    "node_modules",
+    ".git",
+    ".opencode",
+    "build",
+    "dist",
+    ".venv",
+    "__pycache__",
+    ".nx",
+    ".palantir",
+    "osdk-output",
+    "generated-imports",
+];
+/// Earlier installs wrote this list; their rag.json is upgraded in place.
+const LEGACY_EXCLUDE_DIRS: [&str; 7] = [
+    "node_modules",
+    ".git",
+    ".opencode",
+    "build",
+    "dist",
+    ".venv",
+    "__pycache__",
+];
+
+fn rag_config(base_url: &str, exclude_dirs: &[&str]) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "embedding": {"provider": "openai", "baseUrl": format!("{base_url}/api/v2/llm/proxy/openai/v1"), "model": "ri.language-model-service..language-model.text-embedding-3-large_azure", "timeoutMs": 60000, "vectorDimension": 3072},
+            "vectorStore": {"path": "./.opencode/rag_db"},
+            "description": {"enabled": false},
+            "imageDescription": {"enabled": false},
+            "indexing": {"excludeDirs": exclude_dirs, "excludeFiles": ["**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.pdf", "package-lock.json", "pnpm-lock.yaml"], "embedBatchSize": 32, "embedConcurrency": 2}
+        })
+    )
+}
 
 pub fn ready(project: &Path, base_url: &str) -> bool {
     files(project, base_url)
@@ -63,16 +100,7 @@ fn files(project: &Path, base_url: &str) -> Vec<(std::path::PathBuf, String)> {
         (project.join(".opencode/.gitignore"), IGNORE.to_owned()),
         (
             project.join(".opencode/rag.json"),
-            format!(
-                "{}\n",
-                json!({
-                    "embedding": {"provider": "openai", "baseUrl": format!("{base_url}/api/v2/llm/proxy/openai/v1"), "model": "ri.language-model-service..language-model.text-embedding-3-large_azure", "timeoutMs": 60000, "vectorDimension": 3072},
-                    "vectorStore": {"path": "./.opencode/rag_db"},
-                    "description": {"enabled": false},
-                    "imageDescription": {"enabled": false},
-                    "indexing": {"excludeDirs": ["node_modules", ".git", ".opencode", "build", "dist", ".venv", "__pycache__"], "excludeFiles": ["**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.pdf", "package-lock.json", "pnpm-lock.yaml"], "embedBatchSize": 32, "embedConcurrency": 2}
-                })
-            ),
+            rag_config(base_url, &EXCLUDE_DIRS),
         ),
     ]
 }
@@ -100,6 +128,8 @@ fn setup_files(
     let mut rag_owned = false;
     let mut missing = Vec::new();
     let mut legacy_cli = false;
+    let mut legacy_rag = false;
+    let legacy_config = rag_config(base_url, &LEGACY_EXCLUDE_DIRS);
     for (index, (path, expected)) in files.iter().enumerate() {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
@@ -110,12 +140,17 @@ fn setup_files(
                 );
                 let existing = fs::read_to_string(path)?;
                 eyre::ensure!(
-                    existing == *expected || index == 2 && existing == LEGACY_CLI,
+                    existing == *expected
+                        || index == 2 && existing == LEGACY_CLI
+                        || index == 4 && existing == legacy_config,
                     "{} differs from the installer RAG file; not changing it",
                     path.display()
                 );
                 if index == 2 && existing == LEGACY_CLI {
                     legacy_cli = true;
+                }
+                if index == 4 && existing == legacy_config {
+                    legacy_rag = true;
                 }
                 reused += 1;
                 if index == 0 {
@@ -251,12 +286,15 @@ fn setup_files(
         }
         return Err(e);
     }
-    if legacy_cli {
-        let path = project.join(".opencode/rag-cli.mjs");
-        let backup = crate::ops::backup_path(&path);
-        fs::rename(&path, &backup)?;
-        if let Err(error) = fs::write(&path, CLI) {
-            fs::rename(&backup, &path)?;
+    for (upgrade, index) in [(legacy_cli, 2), (legacy_rag, 4)] {
+        if !upgrade {
+            continue;
+        }
+        let (path, text) = &files[index];
+        let backup = crate::ops::backup_path(path);
+        fs::rename(path, &backup)?;
+        if let Err(error) = fs::write(path, text) {
+            fs::rename(&backup, path)?;
             return Err(error.into());
         }
     }
@@ -367,6 +405,39 @@ mod tests {
                     .to_string_lossy()
                     .starts_with("rag-cli.mjs.backup-"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn earlier_rag_config_is_upgraded_to_skip_generated_folders() {
+        let root = crate::ops::backup_path(&std::env::temp_dir().join("rag-config-upgrade"));
+        fs::create_dir(&root).unwrap();
+        setup_files(&root, "https://example.com", false).unwrap();
+        let config = root.join(".opencode/rag.json");
+        let legacy = rag_config("https://example.com", &LEGACY_EXCLUDE_DIRS);
+        fs::write(&config, &legacy).unwrap();
+        fs::create_dir(root.join(".opencode/rag_db")).unwrap();
+        fs::write(root.join(".opencode/rag_db/index"), "preserve").unwrap();
+        setup_files(&root, "https://example.com", true).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), legacy);
+        setup_files(&root, "https://example.com", false).unwrap();
+        let upgraded: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(upgraded["indexing"]["excludeDirs"], json!(EXCLUDE_DIRS));
+        assert_eq!(
+            fs::read_to_string(root.join(".opencode/rag_db/index")).unwrap(),
+            "preserve"
+        );
+        assert!(
+            fs::read_dir(root.join(".opencode"))
+                .unwrap()
+                .map(Result::unwrap)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rag.json.backup-"))
+        );
+        fs::write(&config, "{}").unwrap();
+        assert!(setup_files(&root, "https://example.com", false).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

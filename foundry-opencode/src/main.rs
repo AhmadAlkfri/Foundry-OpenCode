@@ -4,6 +4,7 @@ mod projects;
 mod rag;
 mod stack;
 mod ui;
+mod worktrees;
 
 use std::fs;
 use std::io::Read;
@@ -54,6 +55,8 @@ enum Mode {
     InitRag,
     /// Retire a verified V1 RAG plugin in the current project
     RepairPlugins,
+    /// Move this repository's worktrees to the default branch, link .opencode and reindex RAG
+    SyncWorktrees,
     /// Update packages, global config and assigned repositories
     Update {
         /// Accept saved stacks, repositories and RAG choices without opening the wizard
@@ -79,9 +82,15 @@ fn main() -> eyre::Result<()> {
             println!("{}", version());
             return Ok(());
         }
+        Some(Mode::SyncWorktrees) => {
+            if !worktrees::sync(&std::env::current_dir()?, args.dry_run)? {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some(Mode::Usage) => {
             println!(
-                "foundry-opencode           Install (same as install)\nfoundry-opencode install   Install tools and assign repositories to Foundry stacks\nfoundry-opencode update    Update tools, global config and project assignments\nfoundry-opencode update -y Accept saved defaults and update without the wizard\nfoundry-opencode repair-plugins Retire verified V1 RAG plugin in current project\nfoundry-opencode uninstall Remove tools, configs, credentials and user data\nfoundry-opencode reset     Stop OpenCode/OpenChamber and clear OpenCode cache\nfoundry-opencode init      Configure a Git repository for a Foundry stack\nfoundry-opencode init-rag  Configure and index RAG in the current project\nfoundry-opencode --dry-run uninstall Preview full removal\nfoundry-opencode update -y --dry-run Preview saved defaults without changes\nfoundry-opencode version   Print version\nfoundry-opencode usage     Show these examples"
+                "foundry-opencode           Install (same as install)\nfoundry-opencode install   Install tools and assign repositories to Foundry stacks\nfoundry-opencode update    Update tools, global config and project assignments\nfoundry-opencode update -y Accept saved defaults and update without the wizard\nfoundry-opencode repair-plugins Retire verified V1 RAG plugin in current project\nfoundry-opencode uninstall Remove tools, configs, credentials and user data\nfoundry-opencode reset     Stop OpenCode/OpenChamber and clear OpenCode cache\nfoundry-opencode init      Configure a Git repository for a Foundry stack\nfoundry-opencode init-rag  Configure and index RAG in the current project\nfoundry-opencode sync-worktrees Move worktrees to the default branch, link .opencode, reindex RAG\nfoundry-opencode --dry-run uninstall Preview full removal\nfoundry-opencode update -y --dry-run Preview saved defaults without changes\nfoundry-opencode version   Print version\nfoundry-opencode usage     Show these examples"
             );
             return Ok(());
         }
@@ -158,6 +167,13 @@ fn main() -> eyre::Result<()> {
 
 fn init_rag(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> {
     let cwd = std::env::current_dir()?;
+    if let Ok(Some(main)) = worktrees::main_of(&cwd) {
+        eyre::bail!(
+            "{} is a Git worktree of {}. Run init-rag there; this worktree then gets the shared setup and its own index from foundry-opencode sync-worktrees",
+            cwd.display(),
+            main.display()
+        );
+    }
     let (url, token) = stack::credentials(&cwd)?;
     let preview = rag::setup(&cwd, &url, true, |_, _| unreachable!())?;
     if ui::step_review(
@@ -340,6 +356,9 @@ fn init(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> {
             }
             Err(error) => result.push_str(&format!("\nRAG incomplete: {error}")),
         }
+    }
+    for message in share_worktrees(&cwd) {
+        result.push_str(&format!("\n{message}"));
     }
     notice(terminal, "Project init — complete", &result)
 }
@@ -946,6 +965,23 @@ fn uninstall(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> 
             targets.push(dir.join(name));
         }
     }
+    let mut repositories: Vec<PathBuf> = managed
+        .projects
+        .iter()
+        .map(|project| project.path.clone())
+        .chain(projects.iter().cloned())
+        .filter(|path| path.is_dir())
+        .collect();
+    repositories.sort();
+    repositories.dedup();
+    let shared: Vec<(PathBuf, PathBuf)> = repositories
+        .iter()
+        .flat_map(|repo| {
+            worktrees::linked(repo)
+                .into_iter()
+                .map(move |worktree| (repo.clone(), worktree))
+        })
+        .collect();
     let packages = ["opencode", "opencode-v1", "opencode-v2", "direnv"];
     let npm_packages = cleanup::npm_opencode()?;
     let mut review = format!(
@@ -962,6 +998,22 @@ fn uninstall(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> 
             .collect::<Vec<_>>()
             .join("\n")
     );
+    if !shared.is_empty() {
+        review.push_str(&format!(
+            "\nShared .opencode links, RAG indexes and logs in Git worktrees:\n{}",
+            shared
+                .iter()
+                .map(|(_, worktree)| worktree.join(".opencode").display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    review.push_str(
+        "\nRemove the .opencode entry this installer added to each repository's .git/info/exclude.",
+    );
+    if let Some(change) = worktrees::alias_plan(false, None)? {
+        review.push_str(&format!("\n{change}"));
+    }
     if dry_run {
         review.push_str("\nDry run: no changes.");
     }
@@ -1072,6 +1124,14 @@ fn uninstall(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> 
     for project in &projects {
         remove_rag_entry(project)?;
     }
+    for (repo, worktree) in &shared {
+        worktrees::unlink(repo, worktree)?;
+    }
+    for repo in &repositories {
+        // A folder that is no longer a Git repository has no exclude entry to remove.
+        let _ = worktrees::unexclude(repo);
+    }
+    worktrees::set_alias(false, None)?;
     for path in targets {
         remove_safe(&path)?;
     }
@@ -1449,6 +1509,9 @@ fn collect_install_plan(
             review.push_str(&format!("\nDeselect {}: assignment removed; previous config is preserved for manual removal.", previous.path.display()));
         }
     }
+    if let Some(change) = worktrees::alias_plan(catalog.sync_alias, None)? {
+        review.push_str(&format!("\n{change}"));
+    }
     review.push_str("\nOther .opencode files and existing legacy stack configs are preserved. Tokens are redacted.");
     if dry_run {
         review.push_str("\nDry run: no files, packages, browser or credentials changed.");
@@ -1476,6 +1539,16 @@ fn collect_install_plan(
         catalog,
         cleanup: inventory,
     }))
+}
+
+/// Hides `.opencode` for all worktrees of a configured repository and links their shared config.
+fn share_worktrees(repo: &std::path::Path) -> Vec<String> {
+    worktrees::share(repo).unwrap_or_else(|error| {
+        vec![format!(
+            "Worktree setup incomplete for {}: {error}",
+            repo.display()
+        )]
+    })
 }
 
 fn configure_projects(
@@ -1526,6 +1599,7 @@ fn configure_projects(
                 }
             }
         }
+        result.extend(share_worktrees(&project.path));
         progress.done += 1;
     }
     Ok(result)
@@ -1713,7 +1787,8 @@ fn install(
     }
     ops::replace_config(&config, &staged, existing.then_some(backup.as_path()))?;
     catalog.save(&home()?)?;
-    let migration = configure_projects(terminal, &mut progress, &catalog)?;
+    let mut migration = configure_projects(terminal, &mut progress, &catalog)?;
+    migration.extend(worktrees::set_alias(catalog.sync_alias, None)?);
     remove_direnv(terminal, false)?;
     progress.show(terminal, "Installation complete")?;
     notice(
@@ -1817,6 +1892,9 @@ fn update(
             details.push_str(&format!("\nDeselect {}: assignment removed; previous config is preserved for manual removal.", previous.path.display()));
         }
     }
+    if let Some(change) = worktrees::alias_plan(catalog.sync_alias, None)? {
+        details.push_str(&format!("\n{change}"));
+    }
     details.push_str(
         "\nExisting parent stack configs and unrelated .opencode files remain. Tokens redacted.",
     );
@@ -1898,7 +1976,8 @@ fn update(
     }
     ops::replace_config(&config, &staged, existing.then_some(backup.as_path()))?;
     catalog.save(&user_home)?;
-    let results = configure_projects(terminal, &mut progress, &catalog)?;
+    let mut results = configure_projects(terminal, &mut progress, &catalog)?;
+    results.extend(worktrees::set_alias(catalog.sync_alias, None)?);
     remove_direnv(terminal, false)?;
     let result = format!(
         "Repositories configured. Release {release_version} {}.\n{}",

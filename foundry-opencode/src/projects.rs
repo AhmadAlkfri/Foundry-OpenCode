@@ -30,6 +30,9 @@ pub struct Catalog {
     pub default: Option<Stack>,
     pub stacks: Vec<Stack>,
     pub projects: Vec<Project>,
+    /// Install the `git sync-worktrees` alias (opt-in).
+    #[serde(default)]
+    pub sync_alias: bool,
     #[serde(skip)]
     pub tokens: BTreeMap<String, String>,
 }
@@ -380,6 +383,14 @@ pub fn preflight(repo: &Path) -> eyre::Result<()> {
         "{} is not a repository root",
         repo.display()
     );
+    if let Some(main) = crate::worktrees::main_of(repo)? {
+        eyre::bail!(
+            "{} is a Git worktree of {}; select {} instead. Its worktrees share that configuration (foundry-opencode sync-worktrees)",
+            repo.display(),
+            main.display(),
+            main.display()
+        );
+    }
     let open = repo.join(".opencode");
     match fs::symlink_metadata(&open) {
         Ok(meta) => eyre::ensure!(
@@ -708,6 +719,18 @@ pub fn collect(
             rag,
         });
     }
+    if preset.is_none()
+        && ui::step_checkbox(
+            terminal,
+            "Git worktrees",
+            "Worktrees of a selected repository share its .opencode configuration and keep their own RAG index. Optionally add `git sync-worktrees`, a Git shortcut for `foundry-opencode sync-worktrees`, which moves every worktree to the latest default branch, links the shared configuration and reindexes RAG.",
+            "Install the git sync-worktrees alias",
+            &mut catalog.sync_alias,
+            false,
+        )? != ui::Nav::Next
+    {
+        return Err(Cancelled.into());
+    }
     if let Some(repo) = preset {
         let selected: Vec<_> = projects.iter().map(|item| &item.path).collect();
         eyre::ensure!(
@@ -824,6 +847,36 @@ mod tests {
         std::os::unix::fs::symlink(root.join("other"), root.join(".opencode")).unwrap();
         assert!(preflight(&root).is_err());
         assert!(!root.join("other/opencode.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worktrees_point_to_their_main_checkout_instead_of_becoming_projects() {
+        let root = ops::backup_path(&std::env::temp_dir().join("project-worktree-test"))
+            .with_extension("d");
+        let main = root.join("main");
+        fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                    .args(args)
+                    .current_dir(&main)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "start"]);
+        git(&["worktree", "add", "-q", "--detach", "../linked"]);
+        assert!(preflight(&main).is_ok());
+        let error = preflight(&root.join("linked")).unwrap_err().to_string();
+        assert!(error.contains("is a Git worktree of"), "{error}");
+        assert!(
+            error.contains(&main.canonicalize().unwrap().display().to_string()),
+            "{error}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
