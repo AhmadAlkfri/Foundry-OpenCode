@@ -375,6 +375,32 @@
                             "budgetTokens": 16000
                         }
                     }
+                },
+                "claude-sonnet-5-5": {
+                    "name": "Foundry Claude Sonnet 5.5",
+                    "modelID": "ri.language-model-service..language-model.anthropic-claude-5-5-sonnet",
+                    "limit": {
+                        "context": 1000000,
+                        "output": 128000
+                    },
+                    "capabilities": {
+                        "tools": true,
+                        "input": ["text", "image", "pdf"],
+                        "output": ["text"]
+                    }
+                },
+                "claude-haiku-5-5": {
+                    "name": "Foundry Claude Haiku 5.5",
+                    "modelID": "ri.language-model-service..language-model.anthropic-claude-5-5-haiku",
+                    "limit": {
+                        "context": 1000000,
+                        "output": 128000
+                    },
+                    "capabilities": {
+                        "tools": true,
+                        "input": ["text", "image", "pdf"],
+                        "output": ["text"]
+                    }
                 }
             }
         }
