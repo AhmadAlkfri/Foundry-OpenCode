@@ -54,9 +54,15 @@ await table.update({
   where: `starts_with(filePath, ${sql(from)})`,
   valuesSql: { filePath: `replace(filePath, ${sql(from)}, ${sql(to)})` },
 });
-const left = await table.countRows(`starts_with(filePath, ${sql(from)})`);
-if (left !== 0 || (await table.countRows()) !== rows) {
-  throw new Error(`${left} rows still point at ${from}`);
+// Every row and manifest entry must now point into the worktree; anything else would send its
+// searches (and edits) to another checkout.
+const moved = await table.countRows(`starts_with(filePath, ${sql(to)})`);
+if (moved !== rows || (await table.countRows()) !== rows) {
+  throw new Error(`${rows - moved} of ${rows} rows do not point into ${to}`);
+}
+const manifest = JSON.parse(fs.readFileSync(`${db}/manifest.json`, "utf8"));
+if (!Object.keys(manifest.files ?? {}).every((file) => file.startsWith(to))) {
+  throw new Error(`manifest entries do not point into ${to}`);
 }
 "#;
 
@@ -85,49 +91,64 @@ fn rules() -> Vec<String> {
 fn whole_folder(line: &str) -> bool {
     matches!(
         line.trim(),
-        ".opencode" | ".opencode/" | "/.opencode" | "/.opencode/"
+        ".opencode"
+            | ".opencode/"
+            | "/.opencode"
+            | "/.opencode/"
+            | "**/.opencode"
+            | "**/.opencode/"
     )
 }
 
 /// Removes this installer's block (its marker and the rule lines after it, in any release's
-/// format) from an ignore file, and with `whole` also every whole-folder `.opencode` rule.
-fn strip(text: &str, mark: &str, whole: bool) -> (Vec<String>, bool) {
+/// format) and every whole-folder `.opencode` rule from an ignore file. Returns the remaining
+/// lines, where the block or the first replaced rule was (so the new block keeps its place and
+/// the user's later exceptions keep overriding it), and whether a whole-folder rule was replaced.
+fn strip(text: &str, mark: &str) -> (Vec<String>, Option<usize>, bool) {
     let ours = rules();
     let mut kept = Vec::new();
+    let mut place = None;
     let mut replaced = false;
     let mut lines = text.lines().peekable();
     while let Some(line) = lines.next() {
         if line == mark {
+            place.get_or_insert(kept.len());
             while lines
                 .next_if(|line| LEGACY.contains(line) || ours.iter().any(|rule| rule == line))
                 .is_some()
             {}
-        } else if whole && whole_folder(line) {
+        } else if whole_folder(line) {
+            place.get_or_insert(kept.len());
             replaced = true;
         } else {
             kept.push(line.to_owned());
         }
     }
-    (kept, replaced)
+    (kept, place, replaced)
 }
 
-/// Writes `lines` plus this installer's block with `rules` (none: no block) when that changes the
-/// file. Returns whether it did.
+/// Writes `lines` with this installer's block (`rules`; none: no block) at `place`, or at the end,
+/// when that changes more than a final newline. Keeps the file's line endings. Returns whether it
+/// wrote.
 fn rewrite(
     path: &Path,
     old: &str,
-    lines: &[String],
+    mut lines: Vec<String>,
+    place: Option<usize>,
     mark: &str,
     rules: &[String],
 ) -> eyre::Result<bool> {
-    let mut text = lines
-        .iter()
-        .map(|line| format!("{line}\n"))
-        .collect::<String>();
     if !rules.is_empty() {
-        text.push_str(&format!("{mark}\n{}\n", rules.join("\n")));
+        let at = place.unwrap_or(lines.len());
+        let block = std::iter::once(mark.to_owned()).chain(rules.iter().cloned());
+        lines.splice(at..at, block);
     }
-    if text == old {
+    let newline = if old.contains("\r\n") { "\r\n" } else { "\n" };
+    let text: String = lines
+        .iter()
+        .map(|line| format!("{line}{newline}"))
+        .collect();
+    if text.trim_end() == old.trim_end() {
         return Ok(false);
     }
     fs::create_dir_all(path.parent().unwrap())?;
@@ -150,6 +171,23 @@ fn git_command(dir: &Path) -> Command {
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_PREFIX");
+    command
+}
+
+/// `node`, without the variables Git exports to aliases: the RAG plugin runs Git itself and would
+/// otherwise inspect the checkout the alias ran in, not `dir`.
+fn node_command(dir: &Path) -> Command {
+    let mut command = Command::new("node");
+    command.current_dir(dir);
+    for name in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -335,8 +373,8 @@ fn read_plain(path: &Path) -> eyre::Result<String> {
 fn exclude(repo: &Path) -> eyre::Result<()> {
     let path = exclude_file(repo)?;
     let text = read_plain(&path)?;
-    let (kept, _) = strip(&text, MARK, false);
-    rewrite(&path, &text, &kept, MARK, &rules())?;
+    let (kept, place, _) = strip(&text, MARK);
+    rewrite(&path, &text, kept, place, MARK, &rules())?;
     Ok(())
 }
 
@@ -368,7 +406,7 @@ pub fn ignore(repo: &Path) -> eyre::Result<Vec<String>> {
     let mut messages = Vec::new();
     let gitignore = repo.join(".gitignore");
     let text = read_plain(&gitignore)?;
-    let (kept, replaced) = strip(&text, GITIGNORE_MARK, true);
+    let (kept, place, replaced) = strip(&text, GITIGNORE_MARK);
     let all = rules();
     // The exceptions must follow `.opencode/*`, so they are added with it.
     let (opencode, openchamber) = all.split_at(all.len() - 1);
@@ -384,7 +422,7 @@ pub fn ignore(repo: &Path) -> eyre::Result<Vec<String>> {
     if !provided(&kept, &openchamber[0]) {
         missing.push(openchamber[0].clone());
     }
-    if rewrite(&gitignore, &text, &kept, GITIGNORE_MARK, &missing)? {
+    if rewrite(&gitignore, &text, kept, place, GITIGNORE_MARK, &missing)? {
         messages.push(format!(
             "Updated {}{}: keeps local .opencode/.openchamber setup out of Git and shares .opencode/commands; commit this change",
             gitignore.display(),
@@ -429,12 +467,24 @@ pub fn excluded(repo: &Path) -> bool {
         .is_ok_and(|text| text.lines().any(|line| line == MARK))
 }
 
-/// Removes only the `.git/info/exclude` entry this installer added. `.gitignore` lines are kept.
+/// Removes only the `.git/info/exclude` block this installer added. `.gitignore` lines are kept.
 pub fn unexclude(repo: &Path) -> eyre::Result<()> {
     let path = exclude_file(repo)?;
     let text = read_plain(&path)?;
-    let (kept, _) = strip(&text, MARK, false);
-    rewrite(&path, &text, &kept, MARK, &[])?;
+    let ours = rules();
+    let mut kept = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line == MARK {
+            while lines
+                .next_if(|line| LEGACY.contains(line) || ours.iter().any(|rule| rule == line))
+                .is_some()
+            {}
+        } else {
+            kept.push(line.to_owned());
+        }
+    }
+    rewrite(&path, &text, kept, None, MARK, &[])?;
     Ok(())
 }
 
@@ -535,6 +585,9 @@ fn paint(code: &str, text: &str) -> String {
 fn seed(main: &Path, worktree: &Path) -> eyre::Result<()> {
     let source = main.join(".opencode/rag_db");
     let target = worktree.join(".opencode/rag_db");
+    // Built under another name and renamed only once verified, so an interrupted seed never
+    // leaves an index that points at the main checkout.
+    let staging = worktree.join(".opencode/rag_db.seeding");
     let package: serde_json::Value = serde_json::from_slice(
         &fs::read(main.join(".opencode/node_modules/opencode-rag-plugin/package.json"))
             .wrap_err("RAG plugin not found")?,
@@ -549,27 +602,27 @@ fn seed(main: &Path, worktree: &Path) -> eyre::Result<()> {
         "the main checkout is being indexed right now"
     );
     // An APFS clone (`cp -c`) is instant and shares disk blocks until either side changes.
+    let _ = fs::remove_dir_all(&staging);
     let copied = |flags: &str| {
         Command::new("cp")
             .arg(flags)
             .arg(&source)
-            .arg(&target)
+            .arg(&staging)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
     };
     if !copied("-cR") {
-        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&staging);
         eyre::ensure!(copied("-R"), "could not copy {}", source.display());
     }
     let repointed = (|| -> eyre::Result<()> {
-        let mut child = Command::new("node")
+        let mut child = node_command(&worktree.join(".opencode"))
             .args(["--input-type=module", "-"])
-            .current_dir(worktree.join(".opencode"))
             .env("SEED_FROM", format!("{}/", main.display()))
             .env("SEED_TO", format!("{}/", worktree.display()))
-            .env("SEED_DB", &target)
+            .env("SEED_DB", &staging)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -581,18 +634,22 @@ fn seed(main: &Path, worktree: &Path) -> eyre::Result<()> {
             .unwrap()
             .write_all(SEED_SCRIPT.as_bytes())?;
         let output = child.wait_with_output()?;
+        // Node prints the stack and then its version; the reason is the `Error:` line.
+        let stderr = String::from_utf8_lossy(&output.stderr);
         eyre::ensure!(
             output.status.success(),
             "{}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr
                 .lines()
-                .rfind(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .find(|line| line.starts_with("Error"))
                 .unwrap_or("re-pointing failed")
         );
+        fs::rename(&staging, &target)?;
         Ok(())
     })();
     if repointed.is_err() {
-        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&staging);
     }
     repointed
 }
@@ -643,9 +700,8 @@ fn index(main: &Path, path: &Path, dry_run: bool) -> bool {
     let log = path.join(".opencode/sync-index.log");
     let indexed = File::create(&log).and_then(|out| {
         let err = out.try_clone()?;
-        Command::new("node")
+        node_command(path)
             .args([HELPER, "index"])
-            .current_dir(path)
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err)
@@ -686,7 +742,11 @@ fn changes(path: &Path) -> eyre::Result<String> {
 }
 
 fn report_link(main: &Path, path: &Path) -> bool {
-    match link(main, path) {
+    show_link(main, link(main, path))
+}
+
+fn show_link(main: &Path, linked: eyre::Result<usize>) -> bool {
+    match linked {
         Ok(0) => true,
         Ok(count) => {
             println!(
@@ -745,6 +805,9 @@ pub fn sync(dir: &Path, dry_run: bool, gen_rag: bool) -> eyre::Result<bool> {
             ok = false;
             continue;
         }
+        // Linking first also removes links an earlier release made to shared folders, which Git
+        // would otherwise report as uncommitted work.
+        let linked = (path != &main && !dry_run).then(|| link(&main, path));
         let moved = match &worktree.branch {
             Some(branch) if branch != &default => Err(format!("is on branch {branch}. Not moved.")),
             branch => match changes(path) {
@@ -770,8 +833,8 @@ pub fn sync(dir: &Path, dry_run: bool, gen_rag: bool) -> eyre::Result<bool> {
                 ok = false;
             }
         }
-        if path != &main && !dry_run {
-            ok &= report_link(&main, path);
+        if let Some(linked) = linked {
+            ok &= show_link(&main, linked);
         }
         if gen_rag {
             ok &= index(&main, path, dry_run);
@@ -1100,9 +1163,10 @@ mod tests {
         assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(messages[0].contains("replaced its whole-folder .opencode rule"));
         let rules = ".opencode/*\n!.opencode/commands/\n.openchamber\n";
+        // The block takes the replaced rule's place.
         assert_eq!(
             fs::read_to_string(main.join(".gitignore")).unwrap(),
-            format!("node_modules\n{GITIGNORE_MARK}\n{rules}")
+            format!("{GITIGNORE_MARK}\n{rules}node_modules\n")
         );
         assert_eq!(
             fs::read_to_string(&exclude_path).unwrap(),
@@ -1210,6 +1274,18 @@ mod tests {
             &["worktree", "add", "-q", "--detach", "../untouched"],
         );
         fs::write(root.join("edited/.opencode/commands/deploy.md"), "two\n").unwrap();
+        // An earlier release linked shared folders; a worktree from before they were committed
+        // keeps such a link, which must not count as uncommitted work.
+        run(
+            &main,
+            &["worktree", "add", "-q", "--detach", "../stale", "HEAD~1"],
+        );
+        fs::create_dir(root.join("stale/.opencode")).unwrap();
+        std::os::unix::fs::symlink(
+            main.join(".opencode/commands"),
+            root.join("stale/.opencode/commands"),
+        )
+        .unwrap();
         run(&root, &["clone", "-q", "origin.git", "other"]);
         fs::write(root.join("other/file"), "two\n").unwrap();
         run(&root.join("other"), &["commit", "-qam", "two"]);
@@ -1218,6 +1294,15 @@ mod tests {
         assert_eq!(run(&root.join("edited"), &["rev-parse", "HEAD"]), first);
         let latest = run(&main, &["rev-parse", "origin/main"]);
         assert_eq!(run(&root.join("untouched"), &["rev-parse", "HEAD"]), latest);
+        assert_eq!(run(&root.join("stale"), &["rev-parse", "HEAD"]), latest);
+        // The stale link was removed before moving, so Git checked out a real folder there.
+        assert!(
+            !fs::symlink_metadata(root.join("stale/.opencode/commands"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(root.join("stale/.opencode/commands/deploy.md").is_file());
         assert_eq!(run(&main, &["rev-parse", "HEAD"]), latest);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1341,6 +1426,81 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+    fn status(dir: &Path) -> String {
+        run(dir, &["status", "--porcelain", "-uall"])
+    }
+
+    #[test]
+    fn ignore_rules_keep_their_place_line_endings_and_later_exceptions() {
+        let root = sandbox();
+        let main = repository(&root);
+        fs::create_dir_all(main.join(".opencode/agents")).unwrap();
+        fs::write(main.join(".opencode/agents/review.md"), "shared").unwrap();
+        let gitignore = main.join(".gitignore");
+        // An exception the team added after an earlier release's block keeps working.
+        fs::write(
+            &gitignore,
+            format!("{GITIGNORE_MARK}\n.opencode\n.openchamber\n!.opencode/agents/\ndist\n"),
+        )
+        .unwrap();
+        ignore(&main).unwrap();
+        assert_eq!(
+            fs::read_to_string(&gitignore).unwrap(),
+            format!(
+                "{GITIGNORE_MARK}\n.opencode/*\n!.opencode/commands/\n.openchamber\n!.opencode/agents/\ndist\n"
+            )
+        );
+        assert_eq!(
+            status(&main),
+            "?? .gitignore\n?? .opencode/agents/review.md"
+        );
+        assert!(ignore(&main).unwrap().is_empty());
+
+        // `**/.opencode` hides the shared folders too, in either file; CRLF files stay CRLF.
+        fs::write(&gitignore, "dist\r\n**/.opencode/\r\n").unwrap();
+        fs::write(main.join(".git/info/exclude"), ".opencode\n").unwrap();
+        assert_eq!(ignore(&main).unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(&gitignore).unwrap(),
+            format!(
+                "dist\r\n{GITIGNORE_MARK}\r\n.opencode/*\r\n!.opencode/commands/\r\n.openchamber\r\n"
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(main.join(".git/info/exclude")).unwrap(),
+            format!("{MARK}\n.opencode/*\n!.opencode/commands/\n.openchamber\n")
+        );
+
+        // A missing final newline alone is not a change.
+        let own = root.join("own");
+        fs::create_dir(&own).unwrap();
+        run(&own, &["init", "-q"]);
+        let written = "/.opencode/*\n!/.opencode/commands\n/.openchamber/";
+        fs::write(own.join(".gitignore"), written).unwrap();
+        assert!(ignore(&own).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(own.join(".gitignore")).unwrap(), written);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn node_runs_without_the_variables_git_gives_aliases() {
+        let command = node_command(Path::new("/"));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_PREFIX",
+        ] {
+            assert!(removed.iter().any(|item| item == name), "{name}");
+        }
+    }
+
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()
     }
@@ -1502,6 +1662,25 @@ console.log((await table.query().toArray()).map((row) => row.filePath).sort().jo
             node(&open, &list, &[("DB", &main_db)]),
             format!("{from}dir/other.ts\n{from}file")
         );
+
+        // A row outside the main checkout (an index built under another path) is refused.
+        node(
+            &open,
+            &format!(
+                r#"{LANCE}
+const table = await (await lancedb.connect(process.env.DB)).openTable("chunks");
+await table.add([{{ id: "foreign", filePath: "/elsewhere/file", vector: [9, 9] }}]);
+"#
+            ),
+            &[("DB", &main_db)],
+        );
+        run(&main, &["worktree", "add", "-q", "--detach", "../second"]);
+        let second = root.join("second");
+        link(&main, &second).unwrap();
+        let error = seed(&main, &second).unwrap_err().to_string();
+        assert!(error.contains("do not point into"), "{error}");
+        assert!(!second.join(".opencode/rag_db").exists());
+        assert!(!second.join(".opencode/rag_db.seeding").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
