@@ -49,18 +49,24 @@ If an older project reports `.opencode/plugins/rag-plugin.js` is not a V2 plugin
 The incompatible `context-mode` plugin is disabled by the global config. A missing `palantir-mcp` executable under npm's cache is a separate npm/MCP installation failure; inspect `opencode mcp list` and repair that package's installation rather than deleting OpenCode sessions or configuration.
 
 - Work in Git worktrees
-*Run this command from any checkout of the repository*
-`foundry-opencode sync-worktrees`
+*Run these from any checkout of the repository*
+`foundry-opencode add-worktree [--gen-rag] <git worktree add options>` creates a worktree and links its shared config
+`foundry-opencode sync-worktrees [--gen-rag]` moves every worktree to the latest default branch
+`foundry-opencode generate-rag [--all]` (re)generates RAG for this checkout, or every checkout
 
 Select only a repository's main checkout; the installer refuses its worktrees as separate projects. Each worktree gets a real `.opencode` folder whose config, scripts and dependencies are links to the main checkout's, so editing the config anywhere edits it everywhere. Its RAG index (`rag_db`), logs and backups stay its own. If the main checkout moves, the next sync repairs the links.
 
 `.opencode` and `.openchamber` hold one machine's setup and must never be committed. Install/update add them to each selected repository's `.gitignore` (commit that change) and to its local, never-pushed `.git/info/exclude`, which hides them in every worktree and branch right away. Files a repository already commits there are left in place and reported with the `git rm -r --cached` command to remove them; uninstall removes the exclude entry but keeps the `.gitignore` lines.
 
-`sync-worktrees` fetches the remote the main checkout's branch tracks (or the only remote, or `origin`), finds its default branch, then for every worktree: moves it to the latest default branch (fast-forwards the checkout on that branch, moves detached ones), links any missing shared `.opencode` entries, and runs an incremental `node .opencode/rag-cli.mjs index` (output in `.opencode/sync-index.log`). Worktrees on another branch, with uncommitted changes, or with unpushed commits on the default branch are reported as `FAILED` and not moved, but are still linked and reindexed. It exits non-zero if anything failed; `--dry-run sync-worktrees` previews without fetching or changing anything. A worktree's first index is a full build; later runs only re-embed changed files.
+`sync-worktrees` fetches the remote the main checkout's branch tracks (or the only remote, or `origin`), finds its default branch, then for every worktree: moves it to the latest default branch (fast-forwards the checkout on that branch, moves detached ones) and links any missing shared `.opencode` entries. Worktrees on another branch, with uncommitted changes, or with unpushed commits on the default branch are reported as `FAILED` and not moved, but are still linked. With `--gen-rag` it also (re)indexes every checkout.
 
-Install/update can also add the opt-in Git alias `git sync-worktrees` for the same command. An existing different alias is replaced only after it is shown in the review. Uninstall removes worktree links and indexes, the exclude entry, and the alias if it is still the installer's.
+`add-worktree` runs `git worktree add` with exactly the options you give it (`-b`, `--detach`, paths, and so on), adds the local `.git/info/exclude` entry if it is missing, and links the new worktree's `.opencode`; with `--gen-rag` it also builds the new worktree's RAG index. `generate-rag` (re)indexes only the checkout you are in; `--all` does every checkout of the repository without moving any. `--gen-rag` and `--dry-run` are recognised anywhere among the `add-worktree` options.
 
-New RAG setups also skip `.nx`, `.palantir`, `osdk-output` and `generated-imports`, which hold build caches, local ontology state and generated SDKs. Update upgrades an earlier installer `rag.json` in place with a backup and reindexes, keeping RAG enabled even if that reindex fails; a hand-edited one is left alone.
+Indexing is incremental (output in `.opencode/sync-index.log`). A worktree without an index starts from a copy of the main checkout's index, re-pointed at the worktree, so only files that differ are embedded: seconds instead of minutes. Seeding needs the pinned RAG plugin version and an idle main index; otherwise it falls back to a full build. Every command exits non-zero if anything failed, and `--dry-run` previews without fetching or changing anything.
+
+Install/update can also add the opt-in Git alias `git sync-worktrees` for the same command; `git sync-worktrees --gen-rag` passes the option through. An existing different alias is replaced only after it is shown in the review. Uninstall removes worktree links and indexes, the exclude entry, and the alias if it is still the installer's.
+
+New RAG setups also skip `.nx`, `.palantir`, `osdk-output` and `generated-imports`, which hold build caches, local ontology state and generated SDKs, and send 4 embedding requests at a time (about 1.7x faster than 2). Update upgrades an earlier installer `rag.json` in place with a backup and reindexes, keeping RAG enabled even if that reindex fails; a hand-edited one is left alone.
 
 - Remove installed tools, configs, credentials and session data permanently
 `foundry-opencode uninstall` (review first with `foundry-opencode uninstall --dry-run`)

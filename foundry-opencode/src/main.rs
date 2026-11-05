@@ -47,7 +47,7 @@ struct Args {
     command: Option<Mode>,
 }
 
-#[derive(Clone, Copy, Subcommand)]
+#[derive(Clone, Subcommand)]
 enum Mode {
     /// Configure a Git repository with its assigned Foundry stack
     Init,
@@ -55,8 +55,24 @@ enum Mode {
     InitRag,
     /// Retire a verified V1 RAG plugin in the current project
     RepairPlugins,
-    /// Move this repository's worktrees to the default branch, link .opencode and reindex RAG
-    SyncWorktrees,
+    /// Move this repository's worktrees to the default branch and link .opencode
+    SyncWorktrees {
+        /// Also (re)generate each checkout's RAG index
+        #[arg(long)]
+        gen_rag: bool,
+    },
+    /// Run `git worktree add` with your options, then link .opencode into the new worktree
+    AddWorktree {
+        /// Options for `git worktree add`; add --gen-rag anywhere to also build its RAG index
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        options: Vec<String>,
+    },
+    /// (Re)generate the RAG index of the checkout you are in
+    GenerateRag {
+        /// Also every other checkout (main and worktrees) of this repository
+        #[arg(long)]
+        all: bool,
+    },
     /// Update packages, global config and assigned repositories
     Update {
         /// Accept saved stacks, repositories and RAG choices without opening the wizard
@@ -77,24 +93,31 @@ enum Mode {
 
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
-    match args.command {
+    match &args.command {
+        Some(Mode::SyncWorktrees { gen_rag }) => {
+            return plain(|| worktrees::sync(&std::env::current_dir()?, args.dry_run, *gen_rag));
+        }
+        Some(Mode::AddWorktree { options }) => {
+            let (options, gen_rag, dry_run) = worktree_options(options);
+            return plain(|| {
+                worktrees::add(
+                    &std::env::current_dir()?,
+                    &options,
+                    gen_rag,
+                    dry_run || args.dry_run,
+                )
+            });
+        }
+        Some(Mode::GenerateRag { all }) => {
+            return plain(|| worktrees::generate(&std::env::current_dir()?, *all, args.dry_run));
+        }
         Some(Mode::Version) => {
             println!("{}", version());
             return Ok(());
         }
-        Some(Mode::SyncWorktrees) => {
-            // Exit quietly when piped into `head` instead of panicking on a closed stdout.
-            unsafe {
-                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-            }
-            if !worktrees::sync(&std::env::current_dir()?, args.dry_run)? {
-                std::process::exit(1);
-            }
-            return Ok(());
-        }
         Some(Mode::Usage) => {
             println!(
-                "foundry-opencode           Install (same as install)\nfoundry-opencode install   Install tools and assign repositories to Foundry stacks\nfoundry-opencode update    Update tools, global config and project assignments\nfoundry-opencode update -y Accept saved defaults and update without the wizard\nfoundry-opencode repair-plugins Retire verified V1 RAG plugin in current project\nfoundry-opencode uninstall Remove tools, configs, credentials and user data\nfoundry-opencode reset     Stop OpenCode/OpenChamber and clear OpenCode cache\nfoundry-opencode init      Configure a Git repository for a Foundry stack\nfoundry-opencode init-rag  Configure and index RAG in the current project\nfoundry-opencode sync-worktrees Move worktrees to the default branch, link .opencode, reindex RAG\nfoundry-opencode --dry-run uninstall Preview full removal\nfoundry-opencode update -y --dry-run Preview saved defaults without changes\nfoundry-opencode version   Print version\nfoundry-opencode usage     Show these examples"
+                "foundry-opencode           Install (same as install)\nfoundry-opencode install   Install tools and assign repositories to Foundry stacks\nfoundry-opencode update    Update tools, global config and project assignments\nfoundry-opencode update -y Accept saved defaults and update without the wizard\nfoundry-opencode repair-plugins Retire verified V1 RAG plugin in current project\nfoundry-opencode uninstall Remove tools, configs, credentials and user data\nfoundry-opencode reset     Stop OpenCode/OpenChamber and clear OpenCode cache\nfoundry-opencode init      Configure a Git repository for a Foundry stack\nfoundry-opencode init-rag  Configure and index RAG in the current project\nfoundry-opencode sync-worktrees [--gen-rag] Move worktrees to the default branch, link .opencode (and reindex RAG)\nfoundry-opencode add-worktree [--gen-rag] <git worktree add options> Add a worktree with linked .opencode (and its RAG index)\nfoundry-opencode generate-rag [--all] (Re)generate RAG for this checkout (or every checkout)\nfoundry-opencode --dry-run uninstall Preview full removal\nfoundry-opencode update -y --dry-run Preview saved defaults without changes\nfoundry-opencode version   Print version\nfoundry-opencode usage     Show these examples"
             );
             return Ok(());
         }
@@ -113,7 +136,7 @@ fn main() -> eyre::Result<()> {
     let mut quick_summary = None;
     let staged = match ratatui::run(|terminal| {
         execute!(std::io::stdout(), EnableMouseCapture)?;
-        let result = match args.command.unwrap_or(Mode::Install) {
+        let result = match args.command.clone().unwrap_or(Mode::Install) {
             Mode::Init => init(terminal, args.dry_run).map(|_| None),
             Mode::InitRag => init_rag(terminal, args.dry_run).map(|_| None),
             Mode::RepairPlugins => repair_plugins(terminal, args.dry_run).map(|_| None),
@@ -169,11 +192,35 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Runs a plain-output worktree command: exits 1 when it reports a failure, and quietly when its
+/// output is piped into `head`, instead of panicking on the closed pipe.
+fn plain(command: impl FnOnce() -> eyre::Result<bool>) -> eyre::Result<()> {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    if !command()? {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Separates this installer's `--gen-rag` and `--dry-run` from the `git worktree add` options;
+/// `git worktree add` has neither, so they are recognised anywhere.
+fn worktree_options(options: &[String]) -> (Vec<String>, bool, bool) {
+    let flag = |name: &str| options.iter().any(|option| option == name);
+    let rest = options
+        .iter()
+        .filter(|option| *option != "--gen-rag" && *option != "--dry-run")
+        .cloned()
+        .collect();
+    (rest, flag("--gen-rag"), flag("--dry-run"))
+}
+
 fn init_rag(terminal: &mut DefaultTerminal, dry_run: bool) -> eyre::Result<()> {
     let cwd = std::env::current_dir()?;
     if let Ok(Some(main)) = worktrees::main_of(&cwd) {
         eyre::bail!(
-            "{} is a Git worktree of {}. Run init-rag there; this worktree then gets the shared setup and its own index from foundry-opencode sync-worktrees",
+            "{} is a Git worktree of {}. Run init-rag there; this worktree then gets the shared setup and its own index from foundry-opencode generate-rag",
             cwd.display(),
             main.display()
         );
@@ -2093,6 +2140,57 @@ mod tests {
             args.command.unwrap_or(Mode::Install),
             Mode::Install
         ));
+    }
+
+    #[test]
+    fn worktree_commands_parse_their_flags_and_pass_git_options_through() {
+        let args = Args::try_parse_from([
+            "foundry-opencode",
+            "add-worktree",
+            "-b",
+            "topic",
+            "--gen-rag",
+            "../topic",
+            "--detach",
+        ])
+        .unwrap();
+        let Some(Mode::AddWorktree { options }) = args.command else {
+            panic!("expected add-worktree");
+        };
+        assert_eq!(
+            worktree_options(&options),
+            (
+                vec![
+                    "-b".into(),
+                    "topic".into(),
+                    "../topic".into(),
+                    "--detach".into()
+                ],
+                true,
+                false
+            )
+        );
+        let (_, gen_rag, dry_run) = worktree_options(&["--dry-run".into(), "../x".into()]);
+        assert!(!gen_rag && dry_run);
+        assert!(matches!(
+            Args::try_parse_from(["foundry-opencode", "sync-worktrees", "--gen-rag"])
+                .unwrap()
+                .command,
+            Some(Mode::SyncWorktrees { gen_rag: true })
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["foundry-opencode", "sync-worktrees"])
+                .unwrap()
+                .command,
+            Some(Mode::SyncWorktrees { gen_rag: false })
+        ));
+        assert!(matches!(
+            Args::try_parse_from(["foundry-opencode", "generate-rag", "--all"])
+                .unwrap()
+                .command,
+            Some(Mode::GenerateRag { all: true })
+        ));
+        assert!(Args::try_parse_from(["foundry-opencode", "generate-rag", "--gen-rag"]).is_err());
     }
 
     #[test]

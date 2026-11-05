@@ -723,7 +723,7 @@ pub fn collect(
         && ui::step_checkbox(
             terminal,
             "Git worktrees",
-            "Worktrees of a selected repository share its .opencode configuration and keep their own RAG index. Optionally add `git sync-worktrees`, a Git shortcut for `foundry-opencode sync-worktrees`, which moves every worktree to the latest default branch, links the shared configuration and reindexes RAG.",
+            "Worktrees of a selected repository share its .opencode configuration and keep their own RAG index. Optionally add `git sync-worktrees`, a Git shortcut for `foundry-opencode sync-worktrees`, which moves every worktree to the latest default branch and links the shared configuration; `git sync-worktrees --gen-rag` also reindexes RAG.",
             "Install the git sync-worktrees alias",
             &mut catalog.sync_alias,
             false,

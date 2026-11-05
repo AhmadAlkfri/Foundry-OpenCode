@@ -10,7 +10,9 @@ foundry-opencode update -y      # accept all saved defaults without the wizard
 foundry-opencode update -y --dry-run # preview saved defaults without changes
 foundry-opencode init           # configure this Git repository
 foundry-opencode init-rag       # configure/index RAG in this project
-foundry-opencode sync-worktrees # move worktrees to the default branch, link .opencode, reindex RAG
+foundry-opencode sync-worktrees [--gen-rag]  # move worktrees to the default branch, link .opencode (and reindex RAG)
+foundry-opencode add-worktree [--gen-rag] <git worktree add options>  # add a worktree with linked .opencode (and RAG)
+foundry-opencode generate-rag [--all]  # (re)generate RAG for this checkout (or every checkout)
 foundry-opencode repair-plugins # retire a verified legacy V1 RAG plugin
 foundry-opencode uninstall      # review and remove managed data (irreversible)
 foundry-opencode reset          # stop OpenCode/OpenChamber and clear OpenCode cache
@@ -41,7 +43,7 @@ Select **Initialize RAG** for a repository, or run `foundry-opencode init-rag` f
 
 ## Worktrees
 
-Only a repository's main checkout can be selected; worktrees are refused with a pointer to it. Install/update link each worktree's `.opencode` entries to the main checkout's (the RAG index, logs and backups stay per worktree) and repair links a moved main checkout left dangling. `.opencode` and `.openchamber` are added to each repository's `.gitignore` and to its local `.git/info/exclude`; files already committed there are reported, not removed. `sync-worktrees` uses the remote the main checkout's branch tracks (or the only remote, or `origin`) and moves every clean worktree to its latest default branch, flags branches, uncommitted work and unpushed commits without moving them, links missing entries and reindexes each checkout incrementally. The optional `git sync-worktrees` alias runs it; uninstall removes links, indexes, the exclude entry and the installer's alias.
+Only a repository's main checkout can be selected; worktrees are refused with a pointer to it. Install/update link each worktree's `.opencode` entries to the main checkout's (the RAG index, logs and backups stay per worktree) and repair links a moved main checkout left dangling. `.opencode` and `.openchamber` are added to each repository's `.gitignore` and to its local `.git/info/exclude`; files already committed there are reported, not removed. `sync-worktrees` uses the remote the main checkout's branch tracks (or the only remote, or `origin`) and moves every clean worktree to its latest default branch, flags branches, uncommitted work and unpushed commits without moving them, and links missing entries; `--gen-rag` also reindexes each checkout. `add-worktree` wraps `git worktree add` and links the new worktree; `generate-rag [--all]` reindexes this checkout or all of them. A worktree's first index is seeded from the main checkout's, so only differing files are embedded. The optional `git sync-worktrees` alias runs it; uninstall removes links, indexes, the exclude entry and the installer's alias.
 
 ## Safety
 
