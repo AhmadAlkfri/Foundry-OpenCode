@@ -13,8 +13,11 @@ pub const ALIAS: &str = "!foundry-opencode sync-worktrees";
 const MARK: &str = "# foundry-opencode: worktrees share the main checkout's .opencode (local only)";
 const GITIGNORE_MARK: &str =
     "# foundry-opencode: local OpenCode and OpenChamber setup, never committed";
-/// Folders that hold one machine's OpenCode/OpenChamber setup and must never reach a remote.
-const LOCAL: [&str; 2] = [".opencode", ".openchamber"];
+/// What earlier releases wrote below their markers; replaced by `rules()`.
+const LEGACY: [&str; 2] = [".opencode", ".openchamber"];
+/// Folders inside `.opencode` that teams share through the repository (OpenCode project commands).
+/// They stay in Git and are never linked: each worktree has its own checked-out copy.
+const SHARED: [&str; 1] = ["commands"];
 const HELPER: &str = ".opencode/rag-cli.mjs";
 /// The RAG plugin version whose index layout `SEED_SCRIPT` knows; others get a full index instead.
 const RAG_PLUGIN_VERSION: &str = "1.22.1";
@@ -63,9 +66,73 @@ pub struct Worktree {
     bare: bool,
 }
 
-/// Entries that stay per worktree: the RAG index, logs, runtime state and backups.
+/// Entries that stay per worktree: the RAG index, logs, runtime state, backups and shared folders.
 fn per_worktree(name: &str) -> bool {
-    generated(name) || name.contains(".backup-")
+    generated(name) || name.contains(".backup-") || SHARED.contains(&name)
+}
+
+/// Ignore rules for one machine's setup: everything in `.opencode` except the shared folders, and
+/// all of `.openchamber`. Ignoring `.opencode` as a whole would stop Git from ever seeing
+/// `.opencode/commands`, so the folder's contents are ignored instead.
+fn rules() -> Vec<String> {
+    let mut rules = vec![".opencode/*".to_owned()];
+    rules.extend(SHARED.iter().map(|name| format!("!.opencode/{name}/")));
+    rules.push(".openchamber".into());
+    rules
+}
+
+/// A rule that ignores `.opencode` as a whole, which no later exception can undo.
+fn whole_folder(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        ".opencode" | ".opencode/" | "/.opencode" | "/.opencode/"
+    )
+}
+
+/// Removes this installer's block (its marker and the rule lines after it, in any release's
+/// format) from an ignore file, and with `whole` also every whole-folder `.opencode` rule.
+fn strip(text: &str, mark: &str, whole: bool) -> (Vec<String>, bool) {
+    let ours = rules();
+    let mut kept = Vec::new();
+    let mut replaced = false;
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line == mark {
+            while lines
+                .next_if(|line| LEGACY.contains(line) || ours.iter().any(|rule| rule == line))
+                .is_some()
+            {}
+        } else if whole && whole_folder(line) {
+            replaced = true;
+        } else {
+            kept.push(line.to_owned());
+        }
+    }
+    (kept, replaced)
+}
+
+/// Writes `lines` plus this installer's block with `rules` (none: no block) when that changes the
+/// file. Returns whether it did.
+fn rewrite(
+    path: &Path,
+    old: &str,
+    lines: &[String],
+    mark: &str,
+    rules: &[String],
+) -> eyre::Result<bool> {
+    let mut text = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    if !rules.is_empty() {
+        text.push_str(&format!("{mark}\n{}\n", rules.join("\n")));
+    }
+    if text == old {
+        return Ok(false);
+    }
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(path, text)?;
+    Ok(true)
 }
 
 /// Per-worktree entries an uninstall may delete; config backups are kept for recovery.
@@ -180,6 +247,10 @@ pub fn link(main: &Path, worktree: &Path) -> eyre::Result<usize> {
     for name in names {
         let path = target.join(&name);
         if per_worktree(&name.to_string_lossy()) {
+            // Earlier releases linked shared folders too; each worktree uses its own copy.
+            if SHARED.contains(&&*name.to_string_lossy()) && ours(&path, &source) {
+                fs::remove_file(&path)?;
+            }
             continue;
         }
         match fs::symlink_metadata(&path) {
@@ -259,63 +330,86 @@ fn read_plain(path: &Path) -> eyre::Result<String> {
     }
 }
 
-fn append(path: &Path, text: &str, mark: &str, names: &[&str]) -> eyre::Result<()> {
-    let separator = if text.is_empty() || text.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    fs::write(
-        path,
-        format!("{text}{separator}{mark}\n{}\n", names.join("\n")),
-    )?;
-    Ok(())
-}
-
-/// Adds the local folders to the repository's never-pushed `.git/info/exclude`, which applies to
-/// every worktree and branch at once.
+/// Puts this installer's rules in the repository's never-pushed `.git/info/exclude`, which applies
+/// to every worktree and branch at once. An earlier release's block is replaced.
 fn exclude(repo: &Path) -> eyre::Result<()> {
     let path = exclude_file(repo)?;
     let text = read_plain(&path)?;
-    if !text.lines().any(|line| line == MARK) {
-        fs::create_dir_all(path.parent().unwrap())?;
-        append(&path, &text, MARK, &LOCAL)?;
-    }
+    let (kept, _) = strip(&text, MARK, false);
+    rewrite(&path, &text, &kept, MARK, &rules())?;
     Ok(())
 }
 
-/// Whether `.gitignore` already ignores `name` at the root (`.opencode`, `/.opencode/`, ...).
-fn listed(text: &str, name: &str) -> bool {
-    text.lines()
-        .map(|line| line.trim().trim_start_matches('/').trim_end_matches('/'))
-        .any(|line| line == name)
+/// Whether a remaining `.gitignore` line already provides `rule`, ignoring leading and trailing
+/// slashes (`/.openchamber/` provides `.openchamber`).
+fn provided(lines: &[String], rule: &str) -> bool {
+    let normal = |text: &str| {
+        let text = text.trim();
+        let (negated, rest) = match text.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        (
+            negated,
+            rest.trim_start_matches('/')
+                .trim_end_matches('/')
+                .to_owned(),
+        )
+    };
+    let wanted = normal(rule);
+    lines.iter().any(|line| normal(line) == wanted)
 }
 
-/// Keeps `.opencode` and `.openchamber` out of Git: in the repository's `.gitignore`, so every
-/// clone ignores them, and in `.git/info/exclude`, which covers every worktree and branch before
-/// that change is committed. Files already committed there are reported, never removed.
+/// Keeps one machine's setup out of Git while `.opencode/commands` stays shared: in the
+/// repository's `.gitignore`, so every clone follows it, and in `.git/info/exclude`, which covers
+/// every worktree and branch before that change is committed. Whole-folder `.opencode` rules are
+/// replaced, since they would hide the shared folders. Files already committed are reported.
 pub fn ignore(repo: &Path) -> eyre::Result<Vec<String>> {
     let mut messages = Vec::new();
     let gitignore = repo.join(".gitignore");
     let text = read_plain(&gitignore)?;
-    let missing: Vec<&str> = LOCAL
-        .into_iter()
-        .filter(|name| !listed(&text, name))
-        .collect();
-    if !missing.is_empty() {
-        append(&gitignore, &text, GITIGNORE_MARK, &missing)?;
+    let (kept, replaced) = strip(&text, GITIGNORE_MARK, true);
+    let all = rules();
+    // The exceptions must follow `.opencode/*`, so they are added with it.
+    let (opencode, openchamber) = all.split_at(all.len() - 1);
+    let mut missing: Vec<String> = if provided(&kept, &opencode[0]) {
+        opencode[1..]
+            .iter()
+            .filter(|rule| !provided(&kept, rule))
+            .cloned()
+            .collect()
+    } else {
+        opencode.to_vec()
+    };
+    if !provided(&kept, &openchamber[0]) {
+        missing.push(openchamber[0].clone());
+    }
+    if rewrite(&gitignore, &text, &kept, GITIGNORE_MARK, &missing)? {
         messages.push(format!(
-            "Added {} to {}; commit this change",
-            missing.join(" and "),
-            gitignore.display()
+            "Updated {}{}: keeps local .opencode/.openchamber setup out of Git and shares .opencode/commands; commit this change",
+            gitignore.display(),
+            if replaced {
+                " (replaced its whole-folder .opencode rule)"
+            } else {
+                ""
+            }
         ));
     }
     exclude(repo)?;
-    let tracked = git(repo, &["ls-files", "--", ".opencode", ".openchamber"])?;
+    let tracked = git(
+        repo,
+        &[
+            "ls-files",
+            "--",
+            ".opencode",
+            ".openchamber",
+            ":(exclude).opencode/commands",
+        ],
+    )?;
     if !tracked.is_empty() {
         let files: Vec<&str> = tracked.lines().collect();
         messages.push(format!(
-            "{} commits machine-specific files under .opencode/.openchamber ({}{}). Remove them from the repository with: git rm -r --cached .opencode .openchamber, then commit",
+            "{} commits machine-specific files under .opencode/.openchamber ({}{}). Remove them from the repository with: git rm -r --cached -- .opencode .openchamber ':!.opencode/commands', then commit",
             repo.display(),
             files[..files.len().min(3)].join(", "),
             if files.len() > 3 {
@@ -339,21 +433,8 @@ pub fn excluded(repo: &Path) -> bool {
 pub fn unexclude(repo: &Path) -> eyre::Result<()> {
     let path = exclude_file(repo)?;
     let text = read_plain(&path)?;
-    let mut kept = String::new();
-    let mut changed = false;
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line == MARK {
-            changed = true;
-            while lines.next_if(|line| LOCAL.contains(line)).is_some() {}
-        } else {
-            kept.push_str(line);
-            kept.push('\n');
-        }
-    }
-    if changed {
-        fs::write(&path, kept)?;
-    }
+    let (kept, _) = strip(&text, MARK, false);
+    rewrite(&path, &text, &kept, MARK, &[])?;
     Ok(())
 }
 
@@ -582,6 +663,28 @@ fn index(main: &Path, path: &Path, dry_run: bool) -> bool {
     }
 }
 
+/// Uncommitted changes, ignoring the local setup folders but not the shared ones in `.opencode`.
+fn changes(path: &Path) -> eyre::Result<String> {
+    let local = git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "--",
+            ".",
+            ":(exclude).opencode",
+            ":(exclude).openchamber",
+        ],
+    )?;
+    let shared: Vec<String> = SHARED
+        .iter()
+        .map(|name| format!(".opencode/{name}"))
+        .collect();
+    let mut args = vec!["status", "--porcelain", "--"];
+    args.extend(shared.iter().map(String::as_str));
+    Ok(format!("{local}{}", git(path, &args)?))
+}
+
 fn report_link(main: &Path, path: &Path) -> bool {
     match link(main, path) {
         Ok(0) => true,
@@ -644,17 +747,7 @@ pub fn sync(dir: &Path, dry_run: bool, gen_rag: bool) -> eyre::Result<bool> {
         }
         let moved = match &worktree.branch {
             Some(branch) if branch != &default => Err(format!("is on branch {branch}. Not moved.")),
-            branch => match git(
-                path,
-                &[
-                    "status",
-                    "--porcelain",
-                    "--",
-                    ".",
-                    ":(exclude).opencode",
-                    ":(exclude).openchamber",
-                ],
-            ) {
+            branch => match changes(path) {
                 Err(error) => Err(format!("could not be checked: {error}")),
                 Ok(changes) if !changes.is_empty() => {
                     Err("has uncommitted changes. Not moved.".into())
@@ -989,47 +1082,143 @@ mod tests {
     }
 
     #[test]
-    fn ignore_keeps_local_folders_out_of_git_in_every_clone_and_worktree() {
+    fn ignore_hides_local_setup_but_keeps_opencode_commands_shared() {
         let root = sandbox();
         let main = repository(&root);
         let exclude_path = main.join(".git/info/exclude");
-        fs::write(&exclude_path, "keep").unwrap();
+        // An earlier release's exclude block and a hand-written whole-folder rule.
+        fs::write(
+            &exclude_path,
+            format!("keep\n{MARK}\n.opencode\n.openchamber\n"),
+        )
+        .unwrap();
         fs::write(main.join(".gitignore"), "/.opencode/\nnode_modules").unwrap();
         run(&main, &["add", ".gitignore"]);
         run(&main, &["commit", "-qm", "ignore"]);
         run(&main, &["worktree", "add", "-q", "--detach", "../linked"]);
         let messages = ignore(&main).unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
-        assert!(messages[0].starts_with("Added .openchamber to"));
+        assert!(messages[0].contains("replaced its whole-folder .opencode rule"));
+        let rules = ".opencode/*\n!.opencode/commands/\n.openchamber\n";
         assert_eq!(
             fs::read_to_string(main.join(".gitignore")).unwrap(),
-            format!("/.opencode/\nnode_modules\n{GITIGNORE_MARK}\n.openchamber\n")
+            format!("node_modules\n{GITIGNORE_MARK}\n{rules}")
+        );
+        assert_eq!(
+            fs::read_to_string(&exclude_path).unwrap(),
+            format!("keep\n{MARK}\n{rules}")
         );
         assert!(ignore(&main).unwrap().is_empty());
-        assert!(excluded(&main));
+
+        // An earlier release's .gitignore block is migrated the same way.
+        fs::write(
+            main.join(".gitignore"),
+            format!("node_modules\n{GITIGNORE_MARK}\n.opencode\n.openchamber\n"),
+        )
+        .unwrap();
+        assert_eq!(ignore(&main).unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(main.join(".gitignore")).unwrap(),
+            format!("node_modules\n{GITIGNORE_MARK}\n{rules}")
+        );
+
+        // Only shared commands show up; the rest of the local setup stays hidden everywhere.
+        fs::create_dir_all(main.join(".opencode/commands")).unwrap();
+        fs::write(main.join(".opencode/commands/deploy.md"), "deploy").unwrap();
         fs::create_dir(main.join(".openchamber")).unwrap();
         fs::write(main.join(".openchamber/state"), "local").unwrap();
         link(&main, &root.join("linked")).unwrap();
-        assert_eq!(run(&main, &["status", "--porcelain"]), " M .gitignore");
+        assert_eq!(
+            run(&main, &["status", "--porcelain", "-uall"]),
+            " M .gitignore\n?? .opencode/commands/deploy.md"
+        );
         assert_eq!(run(&root.join("linked"), &["status", "--porcelain"]), "");
+        assert!(fs::symlink_metadata(root.join("linked/.opencode/commands")).is_err());
         assert_eq!(linked(&main), [root.join("linked")]);
         unexclude(&main).unwrap();
         assert_eq!(fs::read_to_string(&exclude_path).unwrap(), "keep\n");
         assert!(!excluded(&main));
 
+        // Equivalent hand-written rules are left alone.
+        let own = root.join("own");
+        fs::create_dir(&own).unwrap();
+        run(&own, &["init", "-q"]);
+        let written = "/.opencode/*\n!/.opencode/commands\n/.openchamber/\n";
+        fs::write(own.join(".gitignore"), written).unwrap();
+        assert!(ignore(&own).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(own.join(".gitignore")).unwrap(), written);
+
+        // Committed local files are reported; committed shared commands are not.
         let tracked = root.join("tracked");
-        fs::create_dir_all(tracked.join(".opencode")).unwrap();
+        fs::create_dir_all(tracked.join(".opencode/commands")).unwrap();
         run(&tracked, &["init", "-q"]);
-        fs::write(tracked.join(".opencode/agent.md"), "shared").unwrap();
-        run(&tracked, &["add", ".opencode/agent.md"]);
+        fs::write(tracked.join(".opencode/agent.md"), "local").unwrap();
+        fs::write(tracked.join(".opencode/commands/review.md"), "shared").unwrap();
+        run(&tracked, &["add", ".opencode"]);
         let messages = ignore(&tracked).unwrap();
-        assert!(messages[0].starts_with("Added .opencode and .openchamber to"));
+        assert!(messages[0].starts_with("Updated"), "{messages:?}");
         assert!(
             messages[1].contains(".opencode/agent.md")
-                && messages[1].contains("git rm -r --cached"),
+                && !messages[1].contains("review.md")
+                && messages[1].contains("':!.opencode/commands'"),
             "{messages:?}"
         );
-        assert_eq!(run(&tracked, &["ls-files"]), ".opencode/agent.md");
+        assert_eq!(
+            run(&tracked, &["ls-files"]),
+            ".opencode/agent.md\n.opencode/commands/review.md"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_folders_are_never_linked_and_earlier_links_to_them_are_removed() {
+        let root = sandbox();
+        let main = repository(&root);
+        fs::create_dir(main.join(".opencode/commands")).unwrap();
+        fs::write(main.join(".opencode/commands/deploy.md"), "deploy").unwrap();
+        let worktree = root.join("linked");
+        fs::create_dir_all(worktree.join(".opencode")).unwrap();
+        std::os::unix::fs::symlink(
+            main.join(".opencode/commands"),
+            worktree.join(".opencode/commands"),
+        )
+        .unwrap();
+        link(&main, &worktree).unwrap();
+        assert!(fs::symlink_metadata(worktree.join(".opencode/commands")).is_err());
+        fs::create_dir(worktree.join(".opencode/commands")).unwrap();
+        fs::write(worktree.join(".opencode/commands/own.md"), "own").unwrap();
+        link(&main, &worktree).unwrap();
+        assert!(worktree.join(".opencode/commands/own.md").is_file());
+        assert!(main.join(".opencode/commands/deploy.md").is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_treats_edited_shared_commands_as_uncommitted_work() {
+        let root = sandbox();
+        let main = repository(&root);
+        exclude(&main).unwrap();
+        fs::create_dir(main.join(".opencode/commands")).unwrap();
+        fs::write(main.join(".opencode/commands/deploy.md"), "one\n").unwrap();
+        run(&main, &["add", ".opencode/commands/deploy.md"]);
+        run(&main, &["commit", "-qm", "commands"]);
+        run(&main, &["push", "-q"]);
+        let first = run(&main, &["rev-parse", "HEAD"]);
+        run(&main, &["worktree", "add", "-q", "--detach", "../edited"]);
+        run(
+            &main,
+            &["worktree", "add", "-q", "--detach", "../untouched"],
+        );
+        fs::write(root.join("edited/.opencode/commands/deploy.md"), "two\n").unwrap();
+        run(&root, &["clone", "-q", "origin.git", "other"]);
+        fs::write(root.join("other/file"), "two\n").unwrap();
+        run(&root.join("other"), &["commit", "-qam", "two"]);
+        run(&root.join("other"), &["push", "-q"]);
+        assert!(!sync(&main, false, false).unwrap());
+        assert_eq!(run(&root.join("edited"), &["rev-parse", "HEAD"]), first);
+        let latest = run(&main, &["rev-parse", "origin/main"]);
+        assert_eq!(run(&root.join("untouched"), &["rev-parse", "HEAD"]), latest);
+        assert_eq!(run(&main, &["rev-parse", "HEAD"]), latest);
         fs::remove_dir_all(root).unwrap();
     }
 
